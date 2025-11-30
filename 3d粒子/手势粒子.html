@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>全息粒子手势交互系统</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Segoe UI', sans-serif; }
+        
+        /* 容器布局 */
+        #canvas-container { width: 100vw; height: 100vh; position: absolute; z-index: 1; }
+        
+        /* 摄像头画中画 */
+        #video-wrapper {
+            position: absolute; bottom: 20px; left: 20px; z-index: 10;
+            width: 200px; height: 150px;
+            border-radius: 12px; overflow: hidden;
+            border: 1px solid rgba(255,255,255,0.2);
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+            background: #000;
+            transition: opacity 0.3s;
+        }
+        #video-element { width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); opacity: 0.8; }
+        
+        /* 状态指示器 */
+        #status-bar {
+            position: absolute; bottom: 10px; left: 50%; transform: translateX(-50%);
+            width: 100%; text-align: center; pointer-events: none;
+            z-index: 5;
+        }
+        .pill {
+            display: inline-block;
+            background: rgba(10,10,10,0.8); color: #00ffcc;
+            padding: 6px 20px; border-radius: 30px;
+            font-size: 13px; letter-spacing: 1px;
+            border: 1px solid rgba(0,255,200,0.3);
+            backdrop-filter: blur(5px);
+        }
+
+        /* 加载动画 */
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: white; font-size: 16px; letter-spacing: 2px;
+            text-transform: uppercase; z-index: 20;
+            pointer-events: none; transition: opacity 0.5s;
+        }
+
+        /* 全屏按钮 */
+        #fs-btn {
+            position: absolute; top: 20px; right: 20px;
+            background: transparent; border: 1px solid rgba(255,255,255,0.3);
+            color: white; padding: 8px 15px; border-radius: 4px;
+            cursor: pointer; z-index: 15; font-size: 12px;
+            transition: all 0.3s;
+        }
+        #fs-btn:hover { background: rgba(255,255,255,0.1); border-color: white; }
+
+        /* GUI调整 */
+        .lil-gui { --background-color: rgba(10, 10, 10, 0.85); --text-color: #eee; }
+    </style>
+
+    <!-- 核心库 -->
+    <script src="https://unpkg.com/three@0.132.2/build/three.min.js"></script>
+    <script src="https://unpkg.com/lil-gui@0.17.0/dist/lil-gui.umd.min.js"></script>
+    <!-- AI 视觉库 -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+    <div id="loading">正在初始化全息引擎...</div>
+    
+    <div id="video-wrapper">
+        <video id="video-element" playsinline></video>
+    </div>
+
+    <div id="status-bar">
+        <div class="pill" id="status-text">等待手势接入...</div>
+    </div>
+
+    <button id="fs-btn">⛶ 全屏模式</button>
+    <div id="canvas-container"></div>
+
+<script>
+    // ================= 配置参数 =================
+    const CONFIG = {
+        count: 25000,           // 粒子总数
+        particleSize: 0.5,      // 粒子大小
+        model: 'Heart',         // 初始模型
+        globalColor: '#ffffff', // 全局色调混合
+        mixRatio: 0.2,          // 全局色混合强度
+        interactionSmooth: 0.1, // 手势平滑度
+        noiseSpeed: 0.5,        // 粒子浮动速度
+        autoRotate: true        // 无手势时自动旋转
+    };
+
+    // ================= 全局变量 =================
+    let scene, camera, renderer, particleSystem;
+    let originalPositions = []; // 模型原始坐标
+    let targetPositions = [];   // 变换后的目标坐标
+    let originalColors = [];    // 模型原始颜色
+    let time = 0;
+
+    // 手势状态
+    let handState = {
+        detected: false,
+        scale: 1.0,         // 张合控制缩放
+        rotationX: 0,       // 手掌水平位置 -> Y轴旋转
+        rotationZ: 0,       // 手掌倾斜 -> Z轴旋转
+        centerX: 0,
+        centerY: 0
+    };
+    // 平滑后的手势数据
+    let smoothHand = { scale: 1.0, rotX: 0, rotZ: 0 };
+
+    // ================= 1. 图形引擎 (Three.js) =================
+    function initThree() {
+        const container = document.getElementById('canvas-container');
+        
+        scene = new THREE.Scene();
+        scene.fog = new THREE.FogExp2(0x000000, 0.02);
+
+        camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        camera.position.z = 35;
+
+        renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+        container.appendChild(renderer.domElement);
+
+        createParticles();
+        window.addEventListener('resize', onResize);
+    }
+
+    // 创建粒子系统
+    function createParticles() {
+        const geometry = new THREE.BufferGeometry();
+        const positions = new Float32Array(CONFIG.count * 3);
+        const colors = new Float32Array(CONFIG.count * 3);
+        const sizes = new Float32Array(CONFIG.count);
+        const randoms = new Float32Array(CONFIG.count); // 用于噪点运动
+
+        const colorObj = new THREE.Color();
+
+        for (let i = 0; i < CONFIG.count; i++) {
+            // 初始随机散布
+            positions[i * 3] = (Math.random() - 0.5) * 100;
+            positions[i * 3 + 1] = (Math.random() - 0.5) * 100;
+            positions[i * 3 + 2] = (Math.random() - 0.5) * 100;
+            
+            // 初始颜色
+            colorObj.setHSL(Math.random(), 0.8, 0.5);
+            colors[i * 3] = colorObj.r;
+            colors[i * 3 + 1] = colorObj.g;
+            colors[i * 3 + 2] = colorObj.b;
+
+            sizes[i] = Math.random();
+            randoms[i] = Math.random();
+        }
+
+        geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+        geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+        geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+        geometry.setAttribute('random', new THREE.BufferAttribute(randoms, 1));
+
+        // 生成高光贴图
+        const sprite = getSprite();
+
+        const material = new THREE.PointsMaterial({
+            size: CONFIG.particleSize,
+            map: sprite,
+            vertexColors: true, // 启用顶点颜色
+            blending: THREE.AdditiveBlending, // 叠加发光模式
+            depthWrite: false,
+            transparent: true,
+            opacity: 0.9,
+            sizeAttenuation: true
+        });
+
+        particleSystem = new THREE.Points(geometry, material);
+        scene.add(particleSystem);
+
+        // 初始化缓存数组
+        targetPositions = new Float32Array(positions);
+        updateModel(CONFIG.model);
+    }
+
+    // 动态生成发光纹理
+    function getSprite() {
+        const canvas = document.createElement('canvas');
+        canvas.width = 32; canvas.height = 32;
+        const ctx = canvas.getContext('2d');
+        const grad = ctx.createRadialGradient(16, 16, 0, 16, 16, 16);
+        grad.addColorStop(0, 'rgba(255,255,255,1)');
+        grad.addColorStop(0.2, 'rgba(255,255,255,0.5)');
+        grad.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, 32, 32);
+        return new THREE.CanvasTexture(canvas);
+    }
+
+    // ================= 2. 模型生成算法 =================
+    const MODELS = {
+        'Heart': (i, count) => {
+            const t = Math.random() * Math.PI * 2;
+            const y_factor = Math.random();
+            // 3D爱心公式
+            let x = 16 * Math.pow(Math.sin(t), 3);
+            let y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+            const scale = (0.5 + Math.random()*0.5) * 0.8; 
+            
+            // 增加厚度
+            const z = (Math.random() - 0.5) * 6;
+            
+            // 颜色：中心白 -> 边缘粉红
+            const dist = Math.sqrt(x*x + y*y);
+            const color = new THREE.Color().setHSL(0.95, 0.9, 0.8 - dist/20);
+            
+            return { pos: [x*scale, y*scale, z], col: color };
+        },
+        'Flower': (i, count) => {
+            // 玫瑰线变体
+            const k = 5; // 花瓣数
+            const theta = Math.random() * Math.PI * 2;
+            const r = Math.sin(k * theta) * 10 + 5 + Math.random()*3;
+            const phi = (Math.random()-0.5) * Math.PI * 0.5; // 花瓣弯曲度
+
+            const x = r * Math.cos(theta) * Math.cos(phi);
+            const y = r * Math.sin(theta) * Math.cos(phi);
+            const z = r * Math.sin(phi) * 1.5;
+
+            const color = new THREE.Color().setHSL(0.8 + r/30, 0.8, 0.6);
+            return { pos: [x, y, z], col: color };
+        },
+        'Saturn': (i, count) => {
+            const isRing = i > count * 0.3; // 70%是星环
+            let x, y, z, color;
+            
+            if (!isRing) {
+                // 星体
+                const r = 6;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                x = r * Math.sin(phi) * Math.cos(theta);
+                y = r * Math.sin(phi) * Math.sin(theta);
+                z = r * Math.cos(phi);
+                color = new THREE.Color().setHSL(0.1, 0.8, 0.6); // 金黄色
+            } else {
+                // 星环
+                const angle = Math.random() * Math.PI * 2;
+                const dist = 9 + Math.random() * 8;
+                x = Math.cos(angle) * dist;
+                z = Math.sin(angle) * dist;
+                y = (Math.random()-0.5) * 0.5;
+                // 颜色渐变
+                color = new THREE.Color().setHSL(0.6 + dist/40, 0.6, 0.7);
+            }
+            return { pos: [x, y, z], col: color };
+        },
+        'Buddha': (i, count) => {
+            // 程序化生成打坐轮廓 (球体堆叠)
+            const r = Math.random();
+            let x, y, z;
+            
+            if (r < 0.2) { // 头
+                const rad = 2.5;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                x = rad * Math.sin(phi) * Math.cos(theta);
+                y = rad * Math.sin(phi) * Math.sin(theta) + 5.5;
+                z = rad * Math.cos(phi);
+            } else if (r < 0.55) { // 躯干
+                const rad = 4.0;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                x = rad * Math.sin(phi) * Math.cos(theta);
+                y = rad * Math.sin(phi) * Math.sin(theta) * 1.2; // 稍微拉长
+                z = rad * Math.cos(phi);
+            } else { // 盘腿底座 (扁椭球)
+                const rad = 6.5;
+                const theta = Math.random() * Math.PI * 2;
+                const phi = Math.acos(2 * Math.random() - 1);
+                x = rad * Math.sin(phi) * Math.cos(theta);
+                y = (rad * Math.sin(phi) * Math.sin(theta)) * 0.4 - 3.5; // 压扁并下移
+                z = rad * Math.cos(phi) * 0.8; // Z轴也压一点
+            }
+            const color = new THREE.Color().setHSL(0.12, 0.9, 0.6 + y/15); // 金身
+            return { pos: [x, y, z], col: color };
+        },
+        'Fireworks': (i, count) => {
+            const r = Math.random() * 25;
+            const theta = Math.random() * Math.PI * 2;
+            const phi = Math.acos(2 * Math.random() - 1);
+            const x = r * Math.sin(phi) * Math.cos(theta);
+            const y = r * Math.sin(phi) * Math.sin(theta);
+            const z = r * Math.cos(phi);
+            
+            // 烟花多彩
+            const hue = Math.random();
+            const color = new THREE.Color().setHSL(hue, 1.0, 0.7);
+            return { pos: [x, y, z], col: color };
+        }
+    };
+
+    function updateModel(type) {
+        if (!particleSystem) return;
+        const generator = MODELS[type];
+        
+        // 临时数组
+        const newPos = new Float32Array(CONFIG.count * 3);
+        const newCol = new Float32Array(CONFIG.count * 3);
+
+        for(let i=0; i<CONFIG.count; i++) {
+            const res = generator(i, CONFIG.count);
+            newPos[i*3] = res.pos[0];
+            newPos[i*3+1] = res.pos[1];
+            newPos[i*3+2] = res.pos[2];
+            
+            newCol[i*3] = res.col.r;
+            newCol[i*3+1] = res.col.g;
+            newCol[i*3+2] = res.col.b;
+        }
+
+        originalPositions = newPos; // 存储目标形态的原始坐标(未旋转缩放)
+        originalColors = newCol;    // 存储原始颜色
+        
+        // 颜色立即应用(带混合)，位置在animate中插值
+        const colorsAttr = particleSystem.geometry.attributes.color;
+        
+        // 混合用户选择的颜色
+        const userColor = new THREE.Color(CONFIG.globalColor);
+        for(let i=0; i<CONFIG.count; i++) {
+            const r = originalColors[i*3];
+            const g = originalColors[i*3+1];
+            const b = originalColors[i*3+2];
+            
+            // 简单的RGB lerp混合
+            colorsAttr.setXYZ(i, 
+                r * (1-CONFIG.mixRatio) + userColor.r * CONFIG.mixRatio,
+                g * (1-CONFIG.mixRatio) + userColor.g * CONFIG.mixRatio,
+                b * (1-CONFIG.mixRatio) + userColor.b * CONFIG.mixRatio
+            );
+        }
+        colorsAttr.needsUpdate = true;
+    }
+    
+    // 颜色更新辅助
+    function refreshColor() {
+        if(!originalColors.length) return;
+        const colorsAttr = particleSystem.geometry.attributes.color;
+        const userColor = new THREE.Color(CONFIG.globalColor);
+        
+        for(let i=0; i<CONFIG.count; i++) {
+            colorsAttr.setXYZ(i, 
+                originalColors[i*3] * (1-CONFIG.mixRatio) + userColor.r * CONFIG.mixRatio,
+                originalColors[i*3+1] * (1-CONFIG.mixRatio) + userColor.g * CONFIG.mixRatio,
+                originalColors[i*3+2] * (1-CONFIG.mixRatio) + userColor.b * CONFIG.mixRatio
+            );
+        }
+        colorsAttr.needsUpdate = true;
+    }
+
+    // ================= 3. 手势识别逻辑 (核心) =================
+    function setupMediaPipe() {
+        const videoElement = document.getElementById('video-element');
+        const hands = new Hands({locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+
+        hands.setOptions({
+            maxNumHands: 1, // 专注单手控制
+            modelComplexity: 1,
+            minDetectionConfidence: 0.6,
+            minTrackingConfidence: 0.6
+        });
+
+        hands.onResults(results => {
+            if (results.multiHandLandmarks.length > 0) {
+                handState.detected = true;
+                const lm = results.multiHandLandmarks[0];
+
+                // --- A. 计算张开度 (缩放) ---
+                // 比较指尖到手腕的距离 与 手掌基准长度
+                const wrist = lm[0];
+                const middleTip = lm[12];
+                const middleBase = lm[9]; // 中指根部
+                
+                const palmLen = Math.hypot(middleBase.x - wrist.x, middleBase.y - wrist.y);
+                const fingerLen = Math.hypot(middleTip.x - wrist.x, middleTip.y - wrist.y);
+                
+                // 比率 > 1.8 认为是张开，< 1.0 认为是握拳
+                const ratio = fingerLen / palmLen;
+                // 映射到 0.2 (最小) ~ 2.0 (最大)
+                let targetScale = (ratio - 0.8) * 1.5;
+                targetScale = Math.max(0.1, Math.min(2.5, targetScale));
+                
+                handState.scale = targetScale;
+
+                // --- B. 计算旋转 (核心新功能) ---
+                // 1. 水平平移旋转 (Pan): 手在屏幕左边，模型向左转；在右边向右转
+                // x坐标 0(左) ~ 1(右). 0.5为中心
+                handState.rotationX = (lm[9].x - 0.5) * 3; // 放大系数，增加灵敏度
+
+                // 2. 倾斜旋转 (Roll): 手腕转动
+                // 计算手腕(0)到中指根(9)向量的角度，或者小指根(17)到食指根(5)的向量
+                const p1 = lm[17]; // 小指根
+                const p2 = lm[5];  // 食指根
+                // 计算角度 (atan2返回弧度)
+                const angle = Math.atan2(p1.y - p2.y, p1.x - p2.x);
+                // 修正基准，使平放时接近0
+                handState.rotationZ = -(angle + Math.PI/2); // 负号因为Y轴反向
+
+                // UI 反馈
+                const isOpen = ratio > 1.4;
+                document.getElementById('status-text').innerText = 
+                    `已连接 | ${isOpen ? '🖐 张开(扩散)' : '✊ 握拳(收缩)'} | ↔ 旋转`;
+                document.getElementById('status-text').style.color = '#00ffcc';
+
+            } else {
+                handState.detected = false;
+                document.getElementById('status-text').innerText = "等待手势接入...";
+                document.getElementById('status-text').style.color = '#aaa';
+            }
+        });
+
+        const cameraUtils = new Camera(videoElement, {
+            onFrame: async () => await hands.send({image: videoElement}),
+            width: 320, height: 240
+        });
+        
+        cameraUtils.start().then(() => {
+            document.getElementById('loading').style.opacity = 0;
+        });
+    }
+
+    // ================= 4. 动画循环 =================
+    function animate() {
+        requestAnimationFrame(animate);
+        time += 0.015;
+
+        if (!particleSystem) return;
+
+        // 平滑处理手势数据
+        if (handState.detected) {
+            // Lerp 插值：让动作更跟手，但有惯性
+            smoothHand.scale += (handState.scale - smoothHand.scale) * CONFIG.interactionSmooth;
+            smoothHand.rotX += (handState.rotationX - smoothHand.rotX) * CONFIG.interactionSmooth;
+            smoothHand.rotZ += (handState.rotationZ - smoothHand.rotZ) * CONFIG.interactionSmooth;
+        } else {
+            // 无手势时，呼吸效果 + 自动旋转
+            smoothHand.scale += (1.0 + Math.sin(time)*0.1 - smoothHand.scale) * 0.05;
+            if(CONFIG.autoRotate) {
+                smoothHand.rotX += 0.005; // 持续自转
+            }
+            smoothHand.rotZ *= 0.95; // 归零倾斜
+        }
+
+        const positions = particleSystem.geometry.attributes.position.array;
+        const randoms = particleSystem.geometry.attributes.random.array;
+        
+        // 预计算旋转矩阵 (基于手势)
+        // 顺序：先应用模型原始坐标 -> 缩放 -> 绕Y轴旋转(Pan) -> 绕Z轴旋转(Roll)
+        const cosY = Math.cos(smoothHand.rotX);
+        const sinY = Math.sin(smoothHand.rotX);
+        const cosZ = Math.cos(smoothHand.rotZ);
+        const sinZ = Math.sin(smoothHand.rotZ);
+
+        for (let i = 0; i < CONFIG.count; i++) {
+            const i3 = i * 3;
+            
+            // 1. 获取原始目标位置
+            let x = originalPositions[i3];
+            let y = originalPositions[i3+1];
+            let z = originalPositions[i3+2];
+
+            // 2. 应用缩放 (手掌张合)
+            x *= smoothHand.scale;
+            y *= smoothHand.scale;
+            z *= smoothHand.scale;
+
+            // 3. 添加动态噪点 (呼吸/漂浮感)
+            const noise = Math.sin(time * CONFIG.noiseSpeed + randoms[i] * 10) * 0.2 * smoothHand.scale;
+            x += noise;
+            y += Math.cos(time * CONFIG.noiseSpeed + randoms[i] * 10) * 0.2 * smoothHand.scale;
+            z += noise;
+
+            // 4. 手动旋转矩阵变换
+            // Y轴旋转 (左右转)
+            let tx = x * cosY - z * sinY;
+            let tz = x * sinY + z * cosY;
+            let ty = y;
+
+            // Z轴旋转 (侧倾)
+            let finalX = tx * cosZ - ty * sinZ;
+            let finalY = tx * sinZ + ty * cosZ;
+            let finalZ = tz;
+
+            // 5. 更新位置 (Lerp到计算出的新位置，增加拖尾平滑感)
+            positions[i3]     += (finalX - positions[i3]) * 0.2;
+            positions[i3 + 1] += (finalY - positions[i3 + 1]) * 0.2;
+            positions[i3 + 2] += (finalZ - positions[i3 + 2]) * 0.2;
+        }
+
+        particleSystem.geometry.attributes.position.needsUpdate = true;
+        renderer.render(scene, camera);
+    }
+
+    function onResize() {
+        camera.aspect = window.innerWidth / window.innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    // ================= 5. UI 初始化 =================
+    function initGUI() {
+        const gui = new lil.GUI({ title: '控制台' });
+        
+        gui.add(CONFIG, 'model', Object.keys(MODELS)).name('✨ 模型选择').onChange(updateModel);
+        
+        gui.addColor(CONFIG, 'globalColor').name('🎨 粒子染色').onChange(refreshColor);
+        gui.add(CONFIG, 'mixRatio', 0, 1).name('染色强度').onChange(refreshColor);
+        
+        gui.add(CONFIG, 'particleSize', 0.1, 2.0).name('粒子大小').onChange(v => {
+            if(particleSystem) particleSystem.material.size = v;
+        });
+        
+        gui.add(CONFIG, 'autoRotate').name('自动演示模式');
+        
+        const folder = gui.addFolder('高级设置');
+        folder.add(CONFIG, 'interactionSmooth', 0.01, 0.5).name('跟手灵敏度');
+        folder.add(CONFIG, 'noiseSpeed', 0, 2).name('扰动速度');
+    }
+
+    // 全屏按钮
+    document.getElementById('fs-btn').addEventListener('click', () => {
+        if (!document.fullscreenElement) {
+            document.documentElement.requestFullscreen();
+            document.getElementById('fs-btn').innerText = "退出全屏";
+        } else {
+            document.exitFullscreen();
+            document.getElementById('fs-btn').innerText = "⛶ 全屏模式";
+        }
+    });
+
+    // 启动
+    initThree();
+    initGUI();
+    setupMediaPipe();
+    animate();
+
+</script>
+</body>
+</html>

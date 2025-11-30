@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>AR 手势贪吃蛇</title>
+    <style>
+        body { margin: 0; padding: 0; background: #111; font-family: 'Segoe UI', sans-serif; overflow: hidden; }
+        
+        /* 游戏容器 */
+        #game-container {
+            position: relative;
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        /* 视频隐藏，Canvas用于绘制画面 */
+        video { display: none; }
+        canvas { 
+            position: absolute; 
+            transform: scaleX(-1); /* 镜像翻转，符合镜子直觉 */
+            max-width: 100%; 
+            max-height: 100%;
+        }
+
+        /* UI 层 */
+        #ui-layer {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            pointer-events: none; /* 让点击穿透 */
+            z-index: 10;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        /* 分数板 */
+        #score-board {
+            margin: 20px;
+            font-size: 32px;
+            color: #fff;
+            text-shadow: 0 0 10px #00ff00;
+            font-weight: bold;
+        }
+
+        /* 游戏状态/菜单 */
+        #menu-overlay {
+            position: absolute;
+            top: 50%; left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            pointer-events: auto;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 40px;
+            border-radius: 20px;
+            border: 2px solid #00ff00;
+            backdrop-filter: blur(5px);
+            display: flex; /* JS控制显示隐藏 */
+            flex-direction: column;
+            gap: 20px;
+        }
+
+        h1 { color: #00ff00; margin: 0; text-transform: uppercase; letter-spacing: 5px; }
+        p { color: #ccc; font-size: 18px; }
+        
+        button {
+            padding: 15px 40px;
+            font-size: 20px;
+            background: #00ff00;
+            color: #000;
+            border: none;
+            border-radius: 50px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+        button:hover { transform: scale(1.05); box-shadow: 0 0 20px #00ff00; }
+
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: white; font-size: 24px; }
+    </style>
+
+    <!-- 引入 MediaPipe -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/control_utils/control_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+</head>
+<body>
+
+<div id="loading">正在加载 AI 视觉引擎...</div>
+
+<div id="game-container">
+    <video id="input-video"></video>
+    <canvas id="output-canvas"></canvas>
+    
+    <div id="ui-layer">
+        <div id="score-board">分数: 0</div>
+    </div>
+
+    <div id="menu-overlay">
+        <h1 id="menu-title">AR 贪吃蛇</h1>
+        <p id="menu-desc">伸出食指作为蛇头<br>吃掉苹果，不要碰到身体或墙壁</p>
+        <button id="start-btn" onclick="startGame()" disabled>正在初始化...</button>
+    </div>
+</div>
+
+<script>
+    // ================= 游戏配置 =================
+    const CONFIG = {
+        snakeColor: '#00ff00',
+        snakeWidth: 20,
+        snakeGlow: 20,
+        appleColor: '#ff0055',
+        appleSize: 15,
+        minNodeDistance: 5,  // 蛇身节点最小间距（像素）
+        startLength: 20,     // 初始长度
+        growthPerApple: 15,  // 吃到苹果增加的长度
+        smoothFactor: 0.3,    // 手指移动平滑度 (0.1-1.0)
+        collisionGrace: 15    // 自身碰撞检测豁免（头部后多少个节点不检测）
+    };
+
+    // ================= 全局变量 =================
+    const videoElement = document.getElementById('input-video');
+    const canvasElement = document.getElementById('output-canvas');
+    const canvasCtx = canvasElement.getContext('2d');
+    const menuOverlay = document.getElementById('menu-overlay');
+    const startBtn = document.getElementById('start-btn');
+    const scoreBoard = document.getElementById('score-board');
+    const titleText = document.getElementById('menu-title');
+    const descText = document.getElementById('menu-desc');
+
+    let isGameRunning = false;
+    let isModelLoaded = false;
+    let score = 0;
+    
+    // 游戏实体
+    let snakePath = []; // 存储坐标 {x, y}
+    let snakeLength = CONFIG.startLength;
+    let apple = { x: 0, y: 0, active: false };
+    let fingerTarget = { x: 0, y: 0 }; // 原始识别坐标
+    let headPos = { x: 0, y: 0 };      // 平滑后的坐标
+    let particles = []; // 爆炸特效
+
+    // ================= MediaPipe 初始化 =================
+    const hands = new Hands({locateFile: (file) => {
+        return `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`;
+    }});
+
+    hands.setOptions({
+        maxNumHands: 1,
+        modelComplexity: 1,
+        minDetectionConfidence: 0.7,
+        minTrackingConfidence: 0.7
+    });
+
+    hands.onResults(onResults);
+
+    const camera = new Camera(videoElement, {
+        onFrame: async () => {
+            await hands.send({image: videoElement});
+        },
+        width: 1280,
+        height: 720
+    });
+
+    camera.start()
+        .then(() => {
+            document.getElementById('loading').style.display = 'none';
+            // 摄像头启动后，可能需要一点时间等MediaPipe
+            setTimeout(() => {
+                isModelLoaded = true;
+                startBtn.innerText = "开始游戏";
+                startBtn.disabled = false;
+            }, 1000);
+        })
+        .catch(err => {
+            alert("摄像头启动失败，请检查权限");
+            console.error(err);
+        });
+
+    // ================= 游戏逻辑核心 =================
+
+    function startGame() {
+        if (!isModelLoaded) return;
+        
+        isGameRunning = true;
+        menuOverlay.style.display = 'none';
+        
+        // 重置游戏状态
+        snakePath = [];
+        snakeLength = CONFIG.startLength;
+        score = 0;
+        scoreBoard.innerText = "分数: 0";
+        particles = [];
+        
+        // 初始时让蛇头位于屏幕中心，防止瞬间撞墙
+        headPos = { x: canvasElement.width / 2, y: canvasElement.height / 2 };
+        fingerTarget = { ...headPos };
+        
+        spawnApple();
+    }
+
+    function gameOver(reason) {
+        isGameRunning = false;
+        menuOverlay.style.display = 'flex';
+        titleText.innerText = "游戏结束";
+        descText.innerHTML = `${reason}<br>最终得分: <span style="color:#00ff00;font-size:24px">${score}</span>`;
+        startBtn.innerText = "重新开始";
+    }
+
+    // 生成苹果（避开边缘）
+    function spawnApple() {
+        const margin = 50;
+        apple.x = margin + Math.random() * (canvasElement.width - margin * 2);
+        apple.y = margin + Math.random() * (canvasElement.height - margin * 2);
+        apple.active = true;
+    }
+
+    // 粒子爆炸效果
+    function createExplosion(x, y, color) {
+        for (let i = 0; i < 15; i++) {
+            particles.push({
+                x: x, y: y,
+                vx: (Math.random() - 0.5) * 10,
+                vy: (Math.random() - 0.5) * 10,
+                life: 1.0,
+                color: color
+            });
+        }
+    }
+
+    // 每一帧的处理函数
+    function onResults(results) {
+        // 1. 设置画布尺寸
+        canvasElement.width = videoElement.videoWidth;
+        canvasElement.height = videoElement.videoHeight;
+
+        // 2. 绘制摄像头背景
+        canvasCtx.save();
+        canvasCtx.drawImage(results.image, 0, 0, canvasElement.width, canvasElement.height);
+        
+        // 变暗背景，突出蛇和苹果
+        canvasCtx.fillStyle = 'rgba(0, 0, 0, 0.4)';
+        canvasCtx.fillRect(0, 0, canvasElement.width, canvasElement.height);
+        canvasCtx.restore();
+
+        // 3. 游戏逻辑
+        if (isGameRunning) {
+            updateGame(results);
+        }
+
+        // 4. 绘制粒子
+        drawParticles();
+    }
+
+    function updateGame(results) {
+        // --- A. 获取食指位置 ---
+        if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+            const landmarks = results.multiHandLandmarks[0];
+            const indexFinger = landmarks[8]; // 食指指尖索引
+            
+            // 转换坐标 (0-1 -> 像素)
+            fingerTarget.x = indexFinger.x * canvasElement.width;
+            fingerTarget.y = indexFinger.y * canvasElement.height;
+        }
+
+        // --- B. 平滑移动 (Lerp) ---
+        // 避免手抖导致蛇头乱晃
+        headPos.x += (fingerTarget.x - headPos.x) * CONFIG.smoothFactor;
+        headPos.y += (fingerTarget.y - headPos.y) * CONFIG.smoothFactor;
+
+        // --- C. 碰撞检测：墙壁 ---
+        if (headPos.x < 0 || headPos.x > canvasElement.width || 
+            headPos.y < 0 || headPos.y > canvasElement.height) {
+            gameOver("你撞到了屏幕边缘！");
+            return;
+        }
+
+        // --- D. 更新蛇身路径 ---
+        // 只有当移动距离足够时才添加新节点，防止静止时堆积点
+        if (snakePath.length === 0 || 
+            Math.hypot(headPos.x - snakePath[0].x, headPos.y - snakePath[0].y) > CONFIG.minNodeDistance) {
+            
+            snakePath.unshift({ x: headPos.x, y: headPos.y }); // 加到头部
+        }
+
+        // 限制长度（移除尾部）
+        while (snakePath.length > snakeLength) {
+            snakePath.pop();
+        }
+
+        // --- E. 碰撞检测：自身 (咬尾巴) ---
+        // 从头部后面一定距离开始检测
+        for (let i = CONFIG.collisionGrace; i < snakePath.length; i++) {
+            const segment = snakePath[i];
+            const dist = Math.hypot(headPos.x - segment.x, headPos.y - segment.y);
+            if (dist < CONFIG.snakeWidth / 2) { // 稍微宽容一点
+                gameOver("你咬到了自己的尾巴！");
+                return;
+            }
+        }
+
+        // --- F. 碰撞检测：苹果 ---
+        const distToApple = Math.hypot(headPos.x - apple.x, headPos.y - apple.y);
+        if (distToApple < (CONFIG.snakeWidth + CONFIG.appleSize)) {
+            // 吃到了！
+            score += 10;
+            scoreBoard.innerText = "分数: " + score;
+            snakeLength += CONFIG.growthPerApple;
+            createExplosion(apple.x, apple.y, CONFIG.appleColor);
+            spawnApple();
+        }
+
+        // --- G. 绘制渲染 ---
+        drawApple();
+        drawSnake();
+    }
+
+    // 绘制苹果
+    function drawApple() {
+        if (!apple.active) return;
+        
+        const time = Date.now() * 0.005;
+        const pulse = Math.sin(time) * 3; // 呼吸效果
+
+        canvasCtx.shadowBlur = 20;
+        canvasCtx.shadowColor = CONFIG.appleColor;
+        canvasCtx.fillStyle = CONFIG.appleColor;
+        
+        canvasCtx.beginPath();
+        canvasCtx.arc(apple.x, apple.y, CONFIG.appleSize + pulse, 0, 2 * Math.PI);
+        canvasCtx.fill();
+        
+        // 画个小叶子
+        canvasCtx.shadowBlur = 0;
+        canvasCtx.fillStyle = "#00ff00";
+        canvasCtx.beginPath();
+        canvasCtx.ellipse(apple.x, apple.y - 15, 6, 3, Math.PI / 4, 0, 2 * Math.PI);
+        canvasCtx.fill();
+        
+        canvasCtx.shadowBlur = 0; // 重置
+    }
+
+    // 绘制蛇
+    function drawSnake() {
+        if (snakePath.length < 2) return;
+
+        // 1. 设置样式：发光线条
+        canvasCtx.lineJoin = 'round';
+        canvasCtx.lineCap = 'round';
+        canvasCtx.shadowBlur = CONFIG.snakeGlow;
+        canvasCtx.shadowColor = CONFIG.snakeColor;
+        canvasCtx.strokeStyle = CONFIG.snakeColor;
+
+        // 2. 绘制路径
+        canvasCtx.beginPath();
+        canvasCtx.moveTo(snakePath[0].x, snakePath[0].y);
+
+        // 使用二次贝塞尔曲线让身体更平滑，而不是折线
+        for (let i = 1; i < snakePath.length - 1; i++) {
+            const xc = (snakePath[i].x + snakePath[i + 1].x) / 2;
+            const yc = (snakePath[i].y + snakePath[i + 1].y) / 2;
+            canvasCtx.quadraticCurveTo(snakePath[i].x, snakePath[i].y, xc, yc);
+        }
+        // 连接最后一点
+        if(snakePath.length > 1) {
+             canvasCtx.lineTo(snakePath[snakePath.length-1].x, snakePath[snakePath.length-1].y);
+        }
+
+        // 动态线宽：头粗尾细
+        // 由于Canvas同一路径很难做渐变宽，我们这里用固定宽度，或者分段绘制
+        // 为了性能，这里使用固定宽度但带透明度衰减效果很难实现，所以用标准画法
+        canvasCtx.lineWidth = CONFIG.snakeWidth;
+        canvasCtx.stroke();
+
+        // 绘制蛇头
+        canvasCtx.fillStyle = '#fff';
+        canvasCtx.beginPath();
+        canvasCtx.arc(snakePath[0].x, snakePath[0].y, CONFIG.snakeWidth/1.5, 0, Math.PI*2);
+        canvasCtx.fill();
+        
+        canvasCtx.shadowBlur = 0;
+    }
+
+    // 绘制粒子系统
+    function drawParticles() {
+        for (let i = particles.length - 1; i >= 0; i--) {
+            let p = particles[i];
+            p.life -= 0.05;
+            p.x += p.vx;
+            p.y += p.vy;
+            
+            if (p.life <= 0) {
+                particles.splice(i, 1);
+            } else {
+                canvasCtx.globalAlpha = p.life;
+                canvasCtx.fillStyle = p.color;
+                canvasCtx.beginPath();
+                canvasCtx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+                canvasCtx.fill();
+                canvasCtx.globalAlpha = 1.0;
+            }
+        }
+    }
+
+</script>
+</body>
+</html>
